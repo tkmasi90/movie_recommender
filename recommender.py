@@ -81,6 +81,7 @@ class RecommenderSystem:
 
         u_u_matrix = self.pairwise_common_counts(ratings).astype(float)
 
+        # Apply shrinkage to Spearman similarity
         shrink = u_u_matrix / (u_u_matrix + float(lambda_))
         sim_spear_robust = sim_spearman * shrink
         return sim_pearson, sim_spear_robust
@@ -172,21 +173,24 @@ class RecommenderSystem:
         g_scores = M.min(axis=1).sort_values(ascending=False)
         return g_scores.head(self.topn)
 
-    def group_recs_consensus(self, alpha: float = ALPHA) -> pd.Series:
-        """Generate group recommendations using Consensus method (mean - alpha * std)."""
-
-        M = self.current_group
-        means = M.mean(axis=1)
-        std = M.std(axis=1, ddof=0)
-        g_scores = (means - alpha * std).sort_values(ascending=False)
-        return g_scores.head(self.topn)
-    
     def rank_by_lowest_disagreement(self, movie_ids: list) -> pd.Series:
         """Rank movies by lowest standard deviation of group ratings (least disagreement)."""
 
         M = self.current_group.loc[movie_ids]
         std = M.std(axis=1, ddof=0)
+        # Rank by lowest disagreement
         g_scores = std.sort_values(ascending=True)
+        return g_scores.head(self.topn)
+
+    def group_recs_consensus(self, alpha: float = ALPHA) -> pd.Series:
+        """Generate group recommendations using Consensus method (mean - alpha * std)."""
+
+        M = self.current_group
+        means = M.mean(axis=1)
+        # Calculate standard deviation for each movie. Measures how much group members disagree.
+        std = M.std(axis=1, ddof=0)
+        # Compute a consensus score per movie
+        g_scores = (means - alpha * std).sort_values(ascending=False)
         return g_scores.head(self.topn)
 
     def get_movie_name(self, movieId: int) -> str:
@@ -209,13 +213,12 @@ class RecommenderSystem:
             return "PEARSON" if self.current_method == 'pearson' else "SPEARMAN+shrink"
 
         while True:
-            cmd = input(f"[method={method_label()}] Select [p/1/2/q]: ").strip().lower()
+            cmd = input(f"[method={method_label()}] Select [p/1/2/3/q]: ").strip().lower()
             if cmd == 'q':
                 print("Bye.")
                 break
 
             elif cmd == 'p':
-                # toggle
                 self.current_method = 'pearson' if self.current_method != 'pearson' else 'spearman'
                 print(f"-> Method switched to {method_label()}\n")
 
@@ -236,7 +239,7 @@ class RecommenderSystem:
                     if seed == 0:
                         group = np.random.choice(a=self.ratings.index.tolist(), size=GROUP_SIZE, replace=False).tolist()
                     else:
-                        group = self.topk_neighbors_group(seed_user=seed, sim=sim, k=K)
+                        group = self.topk_neighbors_group(seed_user=seed, sim=sim, k=GROUP_SIZE-1)
                     print(f" Group users (seed={seed}, method={method_label()}): {group}")
                     print()
                     recs = self.group_recs_average(group, self.ratings, sim)
@@ -270,7 +273,7 @@ class RecommenderSystem:
                     if seed == 0:
                         group = np.random.choice(a=self.ratings.index.tolist(), size=GROUP_SIZE, replace=False).tolist()
                     else:
-                        group = self.topk_neighbors_group(seed_user=seed, sim=sim, k=K)
+                        group = self.topk_neighbors_group(seed_user=seed, sim=sim, k=GROUP_SIZE-1)
                     print(f" Group users (seed={seed}, method={method_label()}): {group}")
                     print()
                     recs = self.group_recs_least_misery(group, self.ratings, sim)
