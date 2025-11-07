@@ -66,7 +66,13 @@ These can be adjusted in the .py-file as needed.
 | Parameter    | Description                                         | Default |
 |--------------|-----------------------------------------------------|---------|
 | `GROUP_SIZE` | Number of users in a recommendation group           | `4`     |
-| `MIN_COMMON` | Minimum number of co-rated movies for similarity    | `5`     |
+| `MIN_COMMON` | Minimum number of co-rated movies for similarity    | `15`     |
 | `ALPHA`      | Disagreement weighting in consensus method          | `0.6`   |
 | `K`          | Number of nearest neighbors used in predictions     | `20`    |
 | `TOP_N`      | Number of recommendations returned                  | `10`    |
+
+
+## NOTES
+In group recommendation mode, providing a valid user ID makes the program simulate a **friend group with similar taste profiles**, built from that user’s k-nearest neighbors.
+
+To generate a **completely random group** instead, set the user ID to 0. The system will then create a random set of users without considering similarity.

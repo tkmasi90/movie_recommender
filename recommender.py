@@ -11,7 +11,11 @@ DATA_DIR = os.path.join(ROOT, "ml-latest-small")
 RATINGS_PATH = os.path.join(DATA_DIR, "ratings.csv")
 MOVIES_PATH = os.path.join(DATA_DIR, "movies.csv")
 
-GROUP_SIZE = 4
+GROUP_SIZE = 4 # default group size for recommendations
+MIN_COMMON = 15  # minimum common ratings for similarity
+ALPHA = 0.6  # consensus parameter
+K = 20  # number of neighbors for predictions
+TOP_N = 10  # number of recommendations to return
 
 class DataLoader:
     def __init__(self):
@@ -41,24 +45,27 @@ class RecommenderSystem:
         self.ratings_df = self.loader.read_ratings()
         self.movies_df = self.loader.read_movies()
 
-        # rakennetaan perusmatriisi ja simit kerran
+        # build user-item matrix and similarities
         self.ratings = self.build_user_item_matrix(self.ratings_df)
-        self.min_common = 5
+        self.min_common = MIN_COMMON
         self.sim_pearson, self.sim_spear_robust = self.user_user_similarity(self.ratings, self.min_common)
 
-        # aktiivinen metodi (pearson | spearman)
-        self.current_method = 'spearman'  # vaihda oletusta halutessasi
+        # active method (pearson | spearman)
+        self.current_method = 'spearman' # default
 
+        # current group scores
         self.current_group = pd.DataFrame()
 
+        self.topn = TOP_N
+
     def build_user_item_matrix(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Pivot ratings to user-item matrix with floats and NaNs for missing."""
+        """Create user-item matrix: rows = users, columns = movies, values = ratings."""
 
         ratings = df.pivot(index="userId", columns="movieId", values="rating")
         return ratings.astype(float)
 
     def pairwise_common_counts(self, ratings: pd.DataFrame) -> pd.DataFrame:
-        """ Compute how many co-rated items each user pair has. """
+        """Count how many movies each user pair has rated in common."""
 
         rated = ratings.notna().astype(np.int16)
         counts = rated @ rated.T
@@ -67,15 +74,14 @@ class RecommenderSystem:
         return counts
 
     def user_user_similarity(self, ratings: pd.DataFrame, min_common: int, lambda_: int = 30) -> tuple:
-        """ Compute user-user correlations; also Spearman + shrinkage. """
+        """Compute user-user similarity (Pearson and Spearman with shrinkage)."""
 
         sim_pearson = ratings.T.corr(method="pearson",  min_periods=min_common)
         sim_spearman = ratings.T.corr(method="spearman", min_periods=min_common)
 
-        n_uv = self.pairwise_common_counts(ratings).astype(float)
-        n_uv = n_uv.reindex_like(sim_spearman)
+        u_u_matrix = self.pairwise_common_counts(ratings).astype(float)
 
-        shrink = n_uv / (n_uv + float(lambda_))
+        shrink = u_u_matrix / (u_u_matrix + float(lambda_))
         sim_spear_robust = sim_spearman * shrink
         return sim_pearson, sim_spear_robust
     
@@ -84,43 +90,54 @@ class RecommenderSystem:
         return self.sim_pearson if self.current_method == 'pearson' else self.sim_spear_robust
 
     def predict_scores(self, user: int, movie: int, sim: pd.DataFrame, ratings: pd.DataFrame, k: int) -> float:
-        """ Predict score for user and movie based on k most similar users. """
+        """Predict a user's rating for a movie using k most similar users."""
+
+        # If user has already rated the movie, return that rating
         if movie in ratings.columns and not np.isnan(ratings.at[user, movie]):
             return ratings.at[user, movie]
 
+        # Calculate user mean
         user_mean = ratings.loc[user].mean(skipna=True)
         if np.isnan(user_mean):
             user_mean = ratings.stack().mean()
 
+        # If movie not rated by anyone, return user mean
         if movie not in ratings.columns:
             return user_mean
 
+        # Find users who rated the movie
         users_rated = ratings[movie]
         neighbors = users_rated[users_rated.notna()].index.drop(user, errors='ignore')
         if len(neighbors) == 0:
             return user_mean
 
+        # Get similarities and select top-k
         sims = sim.loc[user, neighbors]
         top = sims.abs().sort_values(ascending=False).head(k).index
         sims_top = sims.loc[top]
-        r_b_p = ratings.loc[top, movie].astype(float)
-        r_b_hat = ratings.loc[top].mean(axis=1, skipna=True).astype(float)
 
-        num = (sims_top * (r_b_p - r_b_hat)).sum()
-        den = sims_top.abs().sum()
+        # Compute prediction
+        r_b_p = ratings.loc[top, movie].astype(float) # ratings by top neighbors
+        r_b_hat = ratings.loc[top].mean(axis=1, skipna=True).astype(float) # their means
+
+        # Calculate weighted sum
+        num = (sims_top * (r_b_p - r_b_hat)).sum() # numerator
+        den = sims_top.abs().sum() # denominator
         if den == 0 or pd.isna(num):
             return user_mean
         return float(user_mean + num / den)
 
     def topk_neighbors_group(self, seed_user: int, sim: pd.DataFrame, k: int = GROUP_SIZE-1) -> list:
-        """ Get top-k similar users to seed_user. """
+        """Return a group consisting of the seed user and their k most similar users."""
 
         s = sim.loc[seed_user].drop(seed_user, errors='ignore').dropna()
         top = s.sort_values(ascending=False).head(k).index.tolist()
         return [seed_user] + top
     
-    def _initialize_group(self, group_users, ratings, sim, k=20) -> pd.DataFrame:
-        """  """
+    def _initialize_group(self, group_users, ratings, sim, k=K) -> pd.DataFrame:
+        """Compute predicted scores for all candidate movies for each user in the group."""
+
+        # Identify candidate movies (not yet rated by any group member)
         seen_by_group = set()
         for u in group_users:
             seen_by_group |= set(ratings.columns[ratings.loc[u].notna()])
@@ -129,6 +146,7 @@ class RecommenderSystem:
         if not candidates:
             return pd.DataFrame()
 
+        # Predict scores for each user in the group for candidate movies
         per_user_scores = {}
         for u in group_users:
             preds = {}
@@ -138,38 +156,38 @@ class RecommenderSystem:
 
         return pd.DataFrame(per_user_scores)
 
-    def group_recs_average(self, group_users, ratings, sim, topn: int = 10) -> pd.Series:
-        """ Generate group recommendations using average strategy. """
+    def group_recs_average(self, group_users, ratings, sim) -> pd.Series:
+        """Generate group recommendations using the Average strategy."""
 
-        M = self._initialize_group(group_users, ratings, sim, k=20)
+        M = self._initialize_group(group_users, ratings, sim, k=K)
         self.current_group = M
         g_scores = M.mean(axis=1).sort_values(ascending=False)
-        return g_scores.head(topn)
+        return g_scores.head(self.topn)
 
-    def group_recs_least_misery(self, group_users, ratings, sim, topn: int = 10) -> pd.Series:
-        """ Generate group recommendations using least misery strategy. """
+    def group_recs_least_misery(self, group_users, ratings, sim) -> pd.Series:
+        """Generate group recommendations using the Least Misery strategy."""
 
-        M = self._initialize_group(group_users, ratings, sim, k=20)
+        M = self._initialize_group(group_users, ratings, sim, k=K)
         self.current_group = M
         g_scores = M.min(axis=1).sort_values(ascending=False)
-        return g_scores.head(topn)
+        return g_scores.head(self.topn)
 
-    def group_recs_consensus(self, topn: int = 10, alpha: float = 0.6) -> pd.Series:
-        """ Generate group recommendations based on consensus (mean - alpha * std). """
+    def group_recs_consensus(self, alpha: float = ALPHA) -> pd.Series:
+        """Generate group recommendations using Consensus method (mean - alpha * std)."""
 
         M = self.current_group
         means = M.mean(axis=1)
         std = M.std(axis=1, ddof=0)
         g_scores = (means - alpha * std).sort_values(ascending=False)
-        return g_scores.head(topn)
+        return g_scores.head(self.topn)
     
-    def rank_by_lowest_disagreement(self, movie_ids: list, topn: int = 10) -> pd.Series:
-        """ Rank given movie IDs by lowest disagreement score. """
+    def rank_by_lowest_disagreement(self, movie_ids: list) -> pd.Series:
+        """Rank movies by lowest standard deviation of group ratings (least disagreement)."""
 
         M = self.current_group.loc[movie_ids]
         std = M.std(axis=1, ddof=0)
         g_scores = std.sort_values(ascending=True)
-        return g_scores.head(topn)
+        return g_scores.head(self.topn)
 
     def get_movie_name(self, movieId: int) -> str:
         """ Get movie title by movieId. """
@@ -206,7 +224,7 @@ class RecommenderSystem:
                     u = int(input(" userId: ").strip())
                     m = int(input(" movieId: ").strip())
                     sim = self._active_sim()
-                    score = self.predict_scores(u, m, sim, self.ratings, k=20)
+                    score = self.predict_scores(u, m, sim, self.ratings, k=K)
                     print(f"Predicted ({method_label()}) u={u}, m={m} ({self.get_movie_name(m)}): {score:.2f}\n")
                 except Exception as e:
                     print(f"Error: {e}\n")
@@ -218,10 +236,10 @@ class RecommenderSystem:
                     if seed == 0:
                         group = np.random.choice(a=self.ratings.index.tolist(), size=GROUP_SIZE, replace=False).tolist()
                     else:
-                        group = self.topk_neighbors_group(seed_user=seed, sim=sim, k=3)
+                        group = self.topk_neighbors_group(seed_user=seed, sim=sim, k=K)
                     print(f" Group users (seed={seed}, method={method_label()}): {group}")
                     print()
-                    recs = self.group_recs_average(group, self.ratings, sim, topn=10)
+                    recs = self.group_recs_average(group, self.ratings, sim)
                     if recs.empty:
                         print(" No candidates found.\n")
                         continue
@@ -233,7 +251,7 @@ class RecommenderSystem:
                     for mid, sc in self.rank_by_lowest_disagreement(recs.index.tolist()).items():
                         print(f"  - {self.get_movie_name(mid)} (ID {mid}): {sc:.2f}")
                     print()
-                    consensus_recs = self.group_recs_consensus(topn=10)
+                    consensus_recs = self.group_recs_consensus()
                     if consensus_recs.empty:
                         print(" No candidates found for disagreement.\n")
                         continue
@@ -252,10 +270,10 @@ class RecommenderSystem:
                     if seed == 0:
                         group = np.random.choice(a=self.ratings.index.tolist(), size=GROUP_SIZE, replace=False).tolist()
                     else:
-                        group = self.topk_neighbors_group(seed_user=seed, sim=sim, k=3)
+                        group = self.topk_neighbors_group(seed_user=seed, sim=sim, k=K)
                     print(f" Group users (seed={seed}, method={method_label()}): {group}")
                     print()
-                    recs = self.group_recs_least_misery(group, self.ratings, sim, topn=10)
+                    recs = self.group_recs_least_misery(group, self.ratings, sim)
                     if recs.empty:
                         print(" No candidates found.\n")
                         continue
@@ -267,7 +285,7 @@ class RecommenderSystem:
                     for mid, sc in self.rank_by_lowest_disagreement(recs.index.tolist()).items():
                         print(f"  - {self.get_movie_name(mid)} (ID {mid}): {sc:.2f}")
                     print()
-                    consensus_recs = self.group_recs_consensus(topn=10)
+                    consensus_recs = self.group_recs_consensus()
                     if consensus_recs.empty:
                         print(" No candidates found for disagreement.\n")
                         continue
